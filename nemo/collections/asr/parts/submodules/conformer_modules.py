@@ -24,6 +24,15 @@ from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
 from nemo.utils import logging
+try:
+    from pytorch_quantization import calib
+    from pytorch_quantization import nn as quant_nn
+    from pytorch_quantization import quant_modules
+    from pytorch_quantization.tensor_quant import QuantDescriptor
+
+    PYTORCH_QUANTIZATION_AVAILABLE = True
+except ImportError:
+    PYTORCH_QUANTIZATION_AVAILABLE = False
 
 __all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
 
@@ -52,20 +61,22 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         dropout_att=0.1,
         pos_bias_u=None,
         pos_bias_v=None,
+        quantize: bool = False,
     ):
         super(ConformerLayer, self).__init__()
 
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
+        self.quantize = quantize
 
         # first feed forward module
         self.norm_feed_forward1 = LayerNorm(d_model)
-        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, quantize=self.quantize)
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
-        self.conv = ConformerConvolution(d_model=d_model, kernel_size=conv_kernel_size, norm_type=conv_norm_type)
+        self.conv = ConformerConvolution(d_model=d_model, kernel_size=conv_kernel_size, norm_type=conv_norm_type, quantize=self.quantize)
 
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
@@ -139,23 +150,43 @@ class ConformerConvolution(nn.Module):
         kernel_size (int): kernel size for depthwise convolution
     """
 
-    def __init__(self, d_model, kernel_size, norm_type='batch_norm'):
+    def __init__(self, d_model, kernel_size, norm_type='batch_norm', quantize: bool = False):
         super(ConformerConvolution, self).__init__()
         assert (kernel_size - 1) % 2 == 0
         self.d_model = d_model
+        self.quantize = quantize
 
-        self.pointwise_conv1 = nn.Conv1d(
-            in_channels=d_model, out_channels=d_model * 2, kernel_size=1, stride=1, padding=0, bias=True
-        )
-        self.depthwise_conv = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=d_model,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=(kernel_size - 1) // 2,
-            groups=d_model,
-            bias=True,
-        )
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.pointwise_conv1 = quant_nn.QuantConv1d(
+                in_channels=d_model, out_channels=d_model * 2, kernel_size=1, stride=1, padding=0, bias=True
+            )
+            self.depthwise_conv = quant_nn.QuantConv1d(
+                in_channels=d_model,
+                out_channels=d_model,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=(kernel_size - 1) // 2,
+                groups=d_model,
+                bias=True,
+            )
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.pointwise_conv1 = nn.Conv1d(
+                in_channels=d_model, out_channels=d_model * 2, kernel_size=1, stride=1, padding=0, bias=True
+            )
+            self.depthwise_conv = nn.Conv1d(
+                in_channels=d_model,
+                out_channels=d_model,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=(kernel_size - 1) // 2,
+                groups=d_model,
+                bias=True,
+            )
         if norm_type == 'batch_norm':
             self.batch_norm = nn.BatchNorm1d(d_model)
         elif norm_type == 'layer_norm':
@@ -164,9 +195,19 @@ class ConformerConvolution(nn.Module):
             raise ValueError(f"conv_norm_type={norm_type} is not valid!")
 
         self.activation = Swish()
-        self.pointwise_conv2 = nn.Conv1d(
-            in_channels=d_model, out_channels=d_model, kernel_size=1, stride=1, padding=0, bias=True
-        )
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.pointwise_conv2 = quant_nn.QuantConv1d(
+                in_channels=d_model, out_channels=d_model, kernel_size=1, stride=1, padding=0, bias=True
+            )
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else: 
+            self.pointwise_conv2 = nn.Conv1d(
+                in_channels=d_model, out_channels=d_model, kernel_size=1, stride=1, padding=0, bias=True
+            )
 
     def forward(self, x, pad_mask=None):
         x = x.transpose(1, 2)
@@ -196,12 +237,30 @@ class ConformerFeedForward(nn.Module):
     feed-forward module of Conformer model.
     """
 
-    def __init__(self, d_model, d_ff, dropout, activation=Swish()):
+    def __init__(self, d_model, d_ff, dropout, activation=Swish(), quantize: bool = False):
         super(ConformerFeedForward, self).__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
+        self.quantize = quantize
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.linear1 = quant_nn.QuantLinear(d_model, d_ff)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.linear1 = nn.Linear(d_model, d_ff)
+
         self.activation = activation
         self.dropout = nn.Dropout(p=dropout)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        if PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            self.linear2 = quant_nn.QuantLinear(d_ff, d_model)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.linear2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
         x = self.linear1(x)

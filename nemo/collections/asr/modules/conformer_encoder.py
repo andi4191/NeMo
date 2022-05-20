@@ -28,6 +28,15 @@ from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
+try:
+    from pytorch_quantization import calib
+    from pytorch_quantization import nn as quant_nn
+    from pytorch_quantization import quant_modules
+    from pytorch_quantization.tensor_quant import QuantDescriptor
+
+    PYTORCH_QUANTIZATION_AVAILABLE = True
+except ImportError:
+    PYTORCH_QUANTIZATION_AVAILABLE = False
 
 __all__ = ['ConformerEncoder']
 
@@ -75,6 +84,8 @@ class ConformerEncoder(NeuralModule, Exportable):
             Defaults to 0.1.
         dropout_att (float): the dropout rate used for the attention layer
             Defaults to 0.0.
+        quantize (bool): quantization flag is enabled
+            Defaults to False
     """
 
     def input_example(self, max_batch=1, max_dim=256):
@@ -131,6 +142,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
+        quantize: bool = False,
     ):
         super().__init__()
 
@@ -138,6 +150,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         self.d_model = d_model
         self._feat_in = feat_in
         self.scale = math.sqrt(self.d_model)
+        self.quantize = quantize
         if att_context_size:
             self.att_context_size = att_context_size
         else:
@@ -153,7 +166,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         if subsampling and subsampling_factor > 1:
             if subsampling == 'stacking':
                 self.pre_encode = StackingSubsampling(
-                    subsampling_factor=subsampling_factor, feat_in=feat_in, feat_out=d_model
+                    subsampling_factor=subsampling_factor, feat_in=feat_in, feat_out=d_model, quantize=self.quantize
                 )
             else:
                 self.pre_encode = ConvSubsampling(
@@ -163,9 +176,10 @@ class ConformerEncoder(NeuralModule, Exportable):
                     feat_out=d_model,
                     conv_channels=subsampling_conv_channels,
                     activation=nn.ReLU(),
+                    quantize=self.quantize,
                 )
         else:
-            self.pre_encode = nn.Linear(feat_in, d_model)
+            self.pre_encode = _get_linear(feat_in, d_model, self.quantize)
 
         self._feat_out = d_model
 
@@ -210,11 +224,12 @@ class ConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
+                quantize=self.quantize
             )
             self.layers.append(layer)
 
         if feat_out > 0 and feat_out != self._feat_out:
-            self.out_proj = nn.Linear(self._feat_out, feat_out)
+            self.out_proj = _get_linear(self._feat_out, feat_out, self.quantize)
             self._feat_out = feat_out
         else:
             self.out_proj = None
@@ -254,7 +269,7 @@ class ConformerEncoder(NeuralModule, Exportable):
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
 
-        if isinstance(self.pre_encode, nn.Linear):
+        if isinstance(self.pre_encode, nn.Linear) or isinstance(self.pre_encode, quant_nn.QuantLinear):
             audio_signal = self.pre_encode(audio_signal)
         else:
             audio_signal, length = self.pre_encode(audio_signal, length)
@@ -286,6 +301,18 @@ class ConformerEncoder(NeuralModule, Exportable):
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
         return audio_signal, length
+
+    def _get_linear(self, feat_in, feat_out, quantize):
+        if PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            return quant_nn.QuantLinear(feat_in, feat_out)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            return nn.Linear(feat_in, feat_out)
+
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes

@@ -16,7 +16,15 @@ import math
 
 import torch
 import torch.nn as nn
+try:
+    from pytorch_quantization import calib
+    from pytorch_quantization import nn as quant_nn
+    from pytorch_quantization import quant_modules
+    from pytorch_quantization.tensor_quant import QuantDescriptor
 
+    PYTORCH_QUANTIZATION_AVAILABLE = True
+except ImportError:
+    PYTORCH_QUANTIZATION_AVAILABLE = False
 
 class StackingSubsampling(torch.nn.Module):
     """Stacking subsampling which simply stacks consecutive frames to reduce the sampling rate
@@ -26,10 +34,19 @@ class StackingSubsampling(torch.nn.Module):
         feat_out (int): size of the output features
     """
 
-    def __init__(self, subsampling_factor, feat_in, feat_out):
+    def __init__(self, subsampling_factor, feat_in, feat_out, quantize=False):
         super(StackingSubsampling, self).__init__()
         self.subsampling_factor = subsampling_factor
-        self.proj_out = torch.nn.Linear(subsampling_factor * feat_in, feat_out)
+        self.quantize = quantize
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.proj_out = quant_nn.QuantLinear(subsampling_factor * feat_in, feat_out)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.proj_out = torch.nn.Linear(subsampling_factor * feat_in, feat_out)
 
     def forward(self, x, lengths):
         b, t, h = x.size()
@@ -55,9 +72,10 @@ class ConvSubsampling(torch.nn.Module):
         activation (Module): activation function, default is nn.ReLU()
     """
 
-    def __init__(self, subsampling, subsampling_factor, feat_in, feat_out, conv_channels, activation=nn.ReLU()):
+    def __init__(self, subsampling, subsampling_factor, feat_in, feat_out, conv_channels, activation=nn.ReLU(), quantize=False):
         super(ConvSubsampling, self).__init__()
         self._subsampling = subsampling
+        self.quantize = quantize
 
         if subsampling_factor % 2 != 0:
             raise ValueError("Sampling factor should be a multiply of 2!")
@@ -75,24 +93,27 @@ class ConvSubsampling(torch.nn.Module):
 
             for i in range(self._sampling_num):
                 layers.append(
-                    torch.nn.Conv2d(
-                        in_channels=in_channels, out_channels=conv_channels, kernel_size=3, stride=1, padding=1
-                    )
+                    self._get_conv2d(in_channels, conv_channels, 3, 1, 1, self.quantize)
+                    #torch.nn.Conv2d(
+                    #    in_channels=in_channels, out_channels=conv_channels, kernel_size=3, stride=1, padding=1
+                    #)
                 )
                 layers.append(activation)
                 layers.append(
-                    torch.nn.Conv2d(
-                        in_channels=conv_channels, out_channels=conv_channels, kernel_size=3, stride=1, padding=1
-                    )
+                    self._get_conv2d(conv_channels, conv_channels, 3, 1, 1, self.quantize)
+                    #torch.nn.Conv2d(
+                    #    in_channels=conv_channels, out_channels=conv_channels, kernel_size=3, stride=1, padding=1
+                    #)
                 )
                 layers.append(activation)
                 layers.append(
-                    torch.nn.MaxPool2d(
-                        kernel_size=self._kernel_size,
-                        stride=self._stride,
-                        padding=self._padding,
-                        ceil_mode=self._ceil_mode,
-                    )
+                    self._get_maxPool2d(self._kernel_size, self._stride, self._padding, self._ceil_mode, self.quantize)
+                    #torch.nn.MaxPool2d(
+                    #    kernel_size=self._kernel_size,
+                    #    stride=self._stride,
+                    #    padding=self._padding,
+                    #    ceil_mode=self._ceil_mode,
+                    #)
                 )
                 in_channels = conv_channels
         elif subsampling == 'striding':
@@ -103,13 +124,14 @@ class ConvSubsampling(torch.nn.Module):
 
             for i in range(self._sampling_num):
                 layers.append(
-                    torch.nn.Conv2d(
-                        in_channels=in_channels,
-                        out_channels=conv_channels,
-                        kernel_size=self._kernel_size,
-                        stride=self._stride,
-                        padding=self._padding,
-                    )
+                    self._get_conv2d(in_channels, conv_channels, self._kernel_size, self._stride, self._padding, self.quantize)
+                    #torch.nn.Conv2d(
+                    #    in_channels=in_channels,
+                    #    out_channels=conv_channels,
+                    #    kernel_size=self._kernel_size,
+                    #    stride=self._stride,
+                    #    padding=self._padding,
+                    #)
                 )
                 layers.append(activation)
                 in_channels = conv_channels
@@ -125,8 +147,60 @@ class ConvSubsampling(torch.nn.Module):
             ceil_mode=self._ceil_mode,
             repeat_num=self._sampling_num,
         )
-        self.out = torch.nn.Linear(conv_channels * int(out_length), feat_out)
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.out = quant_nn.QuantLinear(conv_channels * int(out_length), feat_out)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.out = torch.nn.Linear(conv_channels * int(out_length), feat_out)
         self.conv = torch.nn.Sequential(*layers)
+
+    def _get_conv2d(self, in_channels, out_channels, kernel_size, stride, padding, quantize):
+        if PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            return quant_nn.QuantConv2d(
+                           in_channels=in_channels,
+                            out_channels=out_channels,
+                            kernel_size=kernel_size,
+                            stride=stride,
+                            padding=padding,
+                        )
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            return torch.nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=out_channels,
+                            kernel_size=kernel_size,
+                            stride=stride,
+                            padding=padding,
+                        )
+
+    def _get_maxPool2d(self, kernel_size, stride, padding, ceil_mode, quantize):
+        if PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            return quant_nn.QuantMaxPool2d(
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                ceil_mode=ceil_mode,
+            )
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            return torch.nn.MaxPool2d(
+                            kernel_size=kernel_size,
+                            stride=stride,
+                            padding=padding,
+                            ceil_mode=ceil_mode,
+                        )
 
     def forward(self, x, lengths):
         lengths = calc_length(

@@ -37,6 +37,16 @@ import math
 import torch
 import torch.nn as nn
 
+try:
+    from pytorch_quantization import calib
+    from pytorch_quantization import nn as quant_nn
+    from pytorch_quantization import quant_modules
+    from pytorch_quantization.tensor_quant import QuantDescriptor
+
+    PYTORCH_QUANTIZATION_AVAILABLE = True
+except ImportError:
+    PYTORCH_QUANTIZATION_AVAILABLE = False
+
 __all__ = [
     'RelPositionMultiHeadAttention',
     'RelPositionalEncoding',
@@ -52,7 +62,7 @@ class MultiHeadAttention(nn.Module):
         dropout_rate (float): dropout rate
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate):
+    def __init__(self, n_head, n_feat, dropout_rate, quantize: bool = False):
         """Construct an MultiHeadedAttention object."""
         super(MultiHeadAttention, self).__init__()
         assert n_feat % n_head == 0
@@ -60,11 +70,23 @@ class MultiHeadAttention(nn.Module):
         self.d_k = n_feat // n_head
         self.s_d_k = math.sqrt(self.d_k)
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat)
-        self.linear_k = nn.Linear(n_feat, n_feat)
-        self.linear_v = nn.Linear(n_feat, n_feat)
-        self.linear_out = nn.Linear(n_feat, n_feat)
-        self.dropout = nn.Dropout(p=dropout_rate)
+        self.quantize = quantize
+        if PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            self.linear_q = quant_nn.QuantLinear(n_feat, n_feat)
+            self.linear_k = quant_nn.QuantLinear(n_feat, n_feat)
+            self.linear_v = quant_nn.QuantLinear(n_feat, n_feat)
+            self.linear_out = quant_nn.QuantLinear(n_feat, n_feat)
+        elif not PYTORCH_QUANTIZATION_AVAILABLE and self.quantize:
+            raise ImportError(
+                "pytorch-quantization is not installed. Install from "
+                "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+            )
+        else:
+            self.linear_q = nn.Linear(n_feat, n_feat)
+            self.linear_k = nn.Linear(n_feat, n_feat)
+            self.linear_v = nn.Linear(n_feat, n_feat)
+            self.linear_out = nn.Linear(n_feat, n_feat)
+            self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward_qkv(self, query, key, value):
         """Transforms query, key and value.
